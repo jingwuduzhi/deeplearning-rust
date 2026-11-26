@@ -695,6 +695,10 @@ whose tensors are split over `devices` (crate `burn-shard`).
   implementations through device dispatch instead of dequantizing first.
   ([#6383](https://github.com/tracel-ai/burn/pull/6383))
 
+- Fix `quantize` on CubeCL backends reading flat scales along the wrong axes when the scheme's grid
+  of blocks has more than one axis, such as one scale per row: each row now quantizes under its own
+  scale. ([#6649](https://github.com/tracel-ai/burn/pull/6649))
+
 #### Random operation keys
 
 Random operations now reserve a `RandomKey` when requested, before shard, fusion, or remote queues
@@ -1159,6 +1163,9 @@ See [optimizer-step metrics](./building-blocks/metric.md#optimizer-step-metrics)
   gradients across all parameter groups before group-specific clipping and optimizer updates.
   **Breaking:** `GradientClipping` and `GradientClippingConfig` are now non-exhaustive.
   Add a wildcard arm to downstream matches and handle `GlobalNorm(_)` explicitly when needed.
+
+- Optimizer checkpoints restore each state tensor in its saved numeric dtype, so training can
+  resume when an optimizer's accumulator precision differs from the device default.
 
 - Custom optimizer and scheduler states can now derive `burn::optim::RecordState` in crates
   that depend only on `burn` with the `optim` feature enabled.
