@@ -1164,6 +1164,11 @@ See [optimizer-step metrics](./building-blocks/metric.md#optimizer-step-metrics)
 
 #### Optimizers
 
+- Add `GradientClipping::GlobalNorm(max_norm)` to limit the joint L2 norm of accumulated
+  gradients across all parameter groups before group-specific clipping and optimizer updates.
+  **Breaking:** `GradientClipping` and `GradientClippingConfig` are now non-exhaustive.
+  Add a wildcard arm to downstream matches and handle `GlobalNorm(_)` explicitly when needed.
+
 - Optimizer checkpoints restore each state tensor in its saved numeric dtype, so training can
   resume when an optimizer's accumulator precision differs from the device default.
 
