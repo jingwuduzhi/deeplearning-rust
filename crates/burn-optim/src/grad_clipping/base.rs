@@ -2,17 +2,21 @@ use burn_core as burn;
 
 use burn::{
     config::Config,
-    tensor::{DType, FloatDType, Tensor},
+    tensor::{DType, Tensor},
 };
 
 /// Gradient Clipping provides a way to mitigate exploding gradients
 #[derive(Config, Debug)]
+#[non_exhaustive]
 pub enum GradientClippingConfig {
     /// Clip the gradient by value.
     Value(f32),
 
-    /// Clip the gradient by norm.
+    /// Limit the L2 norm of each gradient tensor independently.
     Norm(f32),
+
+    /// Limit the joint L2 norm of all parameter gradients in a module optimizer step.
+    GlobalNorm(f32),
 }
 
 impl GradientClippingConfig {
@@ -25,24 +29,28 @@ impl GradientClippingConfig {
         match self {
             GradientClippingConfig::Value(val) => GradientClipping::Value(*val),
             GradientClippingConfig::Norm(val) => GradientClipping::Norm(*val),
+            GradientClippingConfig::GlobalNorm(val) => GradientClipping::GlobalNorm(*val),
         }
     }
 }
 
 /// Gradient Clipping provides a way to mitigate exploding gradients
-/// by clipping every component of the gradient by value or by norm during
-/// backpropagation.
+/// before an optimizer update.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum GradientClipping {
     /// Clip the gradient by value.
     Value(f32),
 
-    /// Clip the gradient by norm.
+    /// Limit the L2 norm of each gradient tensor independently.
     Norm(f32),
+
+    /// Limit the joint L2 norm of all parameter gradients in a module optimizer step.
+    GlobalNorm(f32),
 }
 
 impl GradientClipping {
-    /// Clip the gradient.
+    /// Clip a single gradient. For a single tensor, the global norm equals its own L2 norm.
     ///
     /// # Arguments
     ///
@@ -54,7 +62,9 @@ impl GradientClipping {
     pub fn clip_gradient<const D: usize>(&self, grad: Tensor<D>) -> Tensor<D> {
         match self {
             GradientClipping::Value(threshold) => self.clip_by_value(grad, *threshold),
-            GradientClipping::Norm(max_norm) => self.clip_by_norm(grad, *max_norm),
+            GradientClipping::Norm(max_norm) | GradientClipping::GlobalNorm(max_norm) => {
+                self.clip_by_norm(grad, *max_norm)
+            }
         }
     }
 
@@ -68,36 +78,43 @@ impl GradientClipping {
     }
 
     fn clip_by_norm<const D: usize>(&self, grad: Tensor<D>, threshold: f32) -> Tensor<D> {
-        // Compute the norm in F32: in F16 the sum of squares overflows once the norm
-        // exceeds ~256, and BF16 loses too much precision accumulating it.
         let dtype = grad.dtype();
-        let grad = match dtype {
-            DType::F16 | DType::BF16 => grad.cast(FloatDType::F32),
-            _ => grad,
-        };
-
-        let norm = Self::l2_norm(grad.clone());
-        let min_positive = grad
-            .dtype()
-            .finfo()
-            .unwrap_or(FloatDType::F32.finfo())
-            .min_positive;
-        let clip_coef = threshold / norm.add_scalar(min_positive);
-        let clip_coef_clamped = clip_coef.clamp_max(1.0);
-        grad.mul(clip_coef_clamped.unsqueeze()).cast(dtype)
+        let grad = into_norm_precision(grad);
+        let scale = norm_scale(grad.clone().square().sum(), threshold);
+        apply_scale(grad, scale, dtype)
     }
+}
 
-    fn l2_norm<const D: usize>(tensor: Tensor<D>) -> Tensor<1> {
-        let squared = tensor.square();
-        let sum = squared.sum();
-        sum.sqrt()
+/// Widen before squaring so FP16 gradients above 256 have finite squares.
+pub(crate) fn into_norm_precision<const D: usize>(grad: Tensor<D>) -> Tensor<D> {
+    match grad.dtype() {
+        DType::F64 | DType::F32 => grad,
+        _ => grad.dequantize().cast(DType::F32),
+    }
+}
+
+pub(crate) fn norm_scale(sum_squares: Tensor<1>, max_norm: f32) -> Tensor<1> {
+    let norm = sum_squares.sqrt();
+    let within_limit = norm.clone().lower_equal_scalar(max_norm);
+    (max_norm / norm).mask_fill(within_limit, 1.0)
+}
+
+pub(crate) fn apply_scale<const D: usize>(
+    grad: Tensor<D>,
+    scale: Tensor<1>,
+    dtype: DType,
+) -> Tensor<D> {
+    let scaled = grad.dequantize().cast(scale.dtype()) * scale.unsqueeze();
+    match dtype {
+        DType::QFloat(scheme) => scaled.quantize_dynamic(&scheme),
+        _ => scaled.cast(dtype),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::tensor::Tensor;
+    use burn::tensor::{FloatDType, Tensor};
 
     #[test]
     fn test_clip_by_value() {
