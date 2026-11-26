@@ -149,6 +149,9 @@ group-specific clipping or optimizer update. With `with_grad_clipping`, `Norm` l
 fallback parameter's gradient norm independently and `Value` clips its individual elements.
 Pass `Norm` or `Value` to `with_group` to clip gradients in that group.
 
+When gradients are supplied in quantized form, global norm clipping reads one scalar per step
+to preserve their original encoding if the joint norm is within the limit.
+
 Learning-rate schedulers support the same grouping model, so optimizer choice and learning-rate
 policy can be assigned independently. See [Learner](./learner.md#parameter-groups).
 

@@ -1,38 +1,49 @@
 use super::GradAdaptor;
 use crate::{
     GradientsParams,
-    grad_clipping::{apply_scale, into_norm_precision, norm_scale},
+    grad_clipping::{L2Norm, norm_precision, scale_gradient},
 };
 use alloc::vec::Vec;
 use burn_core::{
-    module::{Module, ModuleVisitor, Param},
+    module::{Module, ModuleVisitor, Param, ParamId},
     tensor::{DType, Device, Tensor},
 };
+use hashbrown::HashMap;
 
-struct NormCollector<'a> {
-    source: &'a mut GradAdaptor,
+struct NormCollector {
+    source: GradAdaptor,
     gradients: GradientsParams,
-    device_sums: Vec<(Device, Tensor<1>)>,
+    norms: Vec<(Device, Vec<L2Norm>)>,
+    original_dtypes: HashMap<ParamId, DType>,
+    has_quantized: bool,
 }
 
-impl ModuleVisitor for NormCollector<'_> {
+impl ModuleVisitor for NormCollector {
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
-        // Removing by ID counts shared parameters once and resolves all sources in step_multi.
-        let Some((grad, device)) = self.source.remove::<D>(param.id) else {
+        // Removing by ID counts shared parameters once. A sole contribution retains its
+        // original encoding, while low-precision contributions are widened before addition.
+        let entry = match &mut self.source {
+            GradAdaptor::Single(grads) => grads.remove::<D>(param.id).map(|g| {
+                let device = g.device();
+                let dtype = g.dtype();
+                (g, device, dtype)
+            }),
+            GradAdaptor::Multi(grads) => {
+                grads.remove_with(param.id, |a, b| norm_precision(a) + norm_precision(b))
+            }
+        };
+        let Some((grad, device, dtype)) = entry else {
             return;
         };
-
-        let sum = into_norm_precision(grad.clone()).square().sum();
-        match self.device_sums.iter_mut().find(|(d, _)| *d == device) {
-            Some((_, local)) => {
-                let dtype = if sum.dtype() == DType::F64 {
-                    DType::F64
-                } else {
-                    local.dtype()
-                };
-                *local = local.clone().cast(dtype) + sum.cast(dtype);
-            }
-            None => self.device_sums.push((device, sum)),
+        if grad.dtype() != dtype {
+            self.original_dtypes.insert(param.id, dtype);
+        }
+        self.has_quantized |= matches!(grad.dtype(), DType::QFloat(_));
+        let norm = L2Norm::of(grad.clone());
+        if let Some((_, norms)) = self.norms.iter_mut().find(|(d, _)| *d == device) {
+            norms.push(norm);
+        } else {
+            self.norms.push((device, alloc::vec![norm]));
         }
         self.gradients.register(param.id, grad);
     }
@@ -40,62 +51,100 @@ impl ModuleVisitor for NormCollector<'_> {
 
 pub(super) struct GlobalNorm {
     scales: Vec<(Device, Tensor<1>)>,
+    original_dtypes: HashMap<ParamId, DType>,
+    keep_quantized: bool,
 }
 
 impl GlobalNorm {
-    /// Replace the source with its accumulated gradients and return one copy of the scale per device.
-    pub(super) fn prepare<M: Module>(module: &M, grads: &mut GradAdaptor, max_norm: f32) -> Self {
+    pub(super) fn prepare<M: Module>(
+        module: &M,
+        source: GradAdaptor,
+        limit: f32,
+    ) -> (GradientsParams, Option<Self>) {
         let mut collector = NormCollector {
-            source: grads,
+            source,
             gradients: GradientsParams::new(),
-            device_sums: Vec::new(),
+            norms: Vec::new(),
+            original_dtypes: HashMap::new(),
+            has_quantized: false,
         };
         module.visit(&mut collector);
-        let NormCollector {
-            gradients,
-            device_sums,
-            ..
-        } = collector;
-        *grads = gradients.into();
-
-        Self {
-            scales: Self::device_scales(device_sums, max_norm),
-        }
+        let norm = Self::from_device_norms(
+            collector.norms,
+            collector.original_dtypes,
+            collector.has_quantized,
+            limit,
+        );
+        (collector.gradients, norm)
     }
 
-    fn device_scales(
-        mut sums: Vec<(Device, Tensor<1>)>,
-        max_norm: f32,
-    ) -> Vec<(Device, Tensor<1>)> {
-        if sums.is_empty() {
-            return sums;
-        }
-        // Reduce on a device known to support F64 if any gradient uses it.
-        let root = sums
+    fn from_device_norms(
+        norms: Vec<(Device, Vec<L2Norm>)>,
+        original_dtypes: HashMap<ParamId, DType>,
+        has_quantized: bool,
+        limit: f32,
+    ) -> Option<Self> {
+        let local: Vec<_> = norms
+            .into_iter()
+            .map(|(device, norms)| (device, L2Norm::combine(norms)))
+            .collect();
+        // Reduce where the widest participating dtype is supported.
+        let root = local
             .iter()
-            .position(|(_, s)| s.dtype() == DType::F64)
-            .unwrap_or(0);
-        sums.swap(0, root);
-        let (device, first) = &sums[0];
-        let dtype = first.dtype();
-        let total = sums[1..].iter().fold(first.clone(), |total, (_, local)| {
-            total + local.clone().to_device(device).cast(dtype)
-        });
-        let scale = norm_scale(total, max_norm);
-        for (device, local) in &mut sums[1..] {
-            *local = scale.clone().cast(local.dtype()).to_device(device);
-        }
-        sums[0].1 = scale;
-        sums
+            .find(|(_, n)| n.dtype() == DType::F64)
+            .or_else(|| local.first())?
+            .0
+            .clone();
+        let (devices, partials): (Vec<_>, _) = local
+            .into_iter()
+            .map(|(device, norm)| {
+                let dtype = norm.dtype();
+                let norm = if device == root {
+                    norm
+                } else {
+                    norm.into_device(&root)
+                };
+                ((device, dtype), norm)
+            })
+            .unzip();
+        let sqrt_scale = L2Norm::combine(partials).sqrt_scale(limit);
+        // Quantization parameters are opaque to the optimizer. A single scalar read for
+        // the step lets identity clipping retain the original codes and scales.
+        let keep_quantized = has_quantized && sqrt_scale.clone().into_scalar::<f64>() == 1.;
+        let scales = devices
+            .into_iter()
+            .map(|(device, dtype)| {
+                let scale = if device == root {
+                    sqrt_scale.clone()
+                } else {
+                    sqrt_scale.clone().cast(dtype).to_device(&device)
+                };
+                (device, scale)
+            })
+            .collect();
+        Some(Self {
+            scales,
+            original_dtypes,
+            keep_quantized,
+        })
     }
 
-    pub(super) fn clip<const D: usize>(&self, grad: Tensor<D>, device: &Device) -> Tensor<D> {
-        let (_, scale) = self
+    pub(super) fn clip<const D: usize>(
+        &self,
+        id: ParamId,
+        grad: Tensor<D>,
+        device: &Device,
+    ) -> Tensor<D> {
+        let (_, sqrt_scale) = self
             .scales
             .iter()
             .find(|(d, _)| d == device)
             .expect("gradient device contributed a norm");
-        let dtype = grad.dtype();
-        apply_scale(grad, scale.clone(), dtype)
+        let dtype = self
+            .original_dtypes
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| grad.dtype());
+        scale_gradient(grad, sqrt_scale.clone(), dtype, self.keep_quantized)
     }
 }

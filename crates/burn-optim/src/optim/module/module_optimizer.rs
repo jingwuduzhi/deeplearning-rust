@@ -102,12 +102,7 @@ impl ModuleOptimizer {
     ///
     /// Panics if the global norm limit is negative or NaN.
     pub fn with_grad_clipping(mut self, gradient_clipping: GradientClipping) -> Self {
-        if let GradientClipping::GlobalNorm(max_norm) = gradient_clipping {
-            assert!(
-                max_norm >= 0.0,
-                "GlobalNorm requires a nonnegative limit, got {max_norm}"
-            );
-        }
+        gradient_clipping.validate_global_limit();
         self.optimizers[0].grad_clipping = Some(gradient_clipping);
         self
     }
@@ -116,13 +111,14 @@ impl ModuleOptimizer {
         &mut self,
         lr_policy: ModuleLearningRate,
         module: M,
-        mut grads: GradAdaptor,
+        grads: GradAdaptor,
     ) -> M {
-        let global_norm = match self.grad_clipping() {
+        let (mut grads, global_norm) = match self.grad_clipping() {
             Some(GradientClipping::GlobalNorm(max_norm)) => {
-                Some(GlobalNorm::prepare(&module, &mut grads, *max_norm))
+                let (grads, norm) = GlobalNorm::prepare(&module, grads, *max_norm);
+                (grads.into(), norm)
             }
-            _ => None,
+            _ => (grads, None),
         };
         module.map(&mut ModuleOptimizerMapper {
             path: Vec::new(),
@@ -409,7 +405,7 @@ impl ModuleMapper for ModuleOptimizerMapper<'_> {
                 "The gradient is on the provided device"
             );
             let grad = match &self.global_norm {
-                Some(global_norm) => global_norm.clip(grad, &device),
+                Some(global_norm) => global_norm.clip(id, grad, &device),
                 None => grad,
             };
             let clipped_grad = match &group.grad_clipping {
@@ -798,6 +794,44 @@ mod tests {
             .step(1.0, model, grads);
         assert_params(&updated, [-30.0, -40.0]);
         assert_eq!(updated[0].val().dtype(), DType::F16);
+    }
+
+    #[test]
+    fn global_norm_widens_contributions_before_accumulation() {
+        let model = scalar_params(DType::F16);
+        let grads = MultiGradientsParams {
+            grads: [[40_000., 20_000.]; 2]
+                .map(|values| (scalar_grads(&model, values), Device::default()))
+                .into(),
+        };
+        let mut optim = sgd().with_grad_clipping(GradientClipping::GlobalNorm(5f32.sqrt()));
+        let updated = optim.step_multi(1., model, grads);
+        assert_params(&updated, [-2., -1.]);
+        assert_eq!(updated[0].val().dtype(), DType::F16);
+    }
+
+    #[test]
+    fn global_norm_combines_large_finite_gradients() {
+        let model = scalar_params(DType::F32);
+        let grads = scalar_grads(&model, [3e20, 4e20]);
+        let mut optim = sgd().with_grad_clipping(GradientClipping::GlobalNorm(1.));
+        assert_params(&optim.step(1., model, grads), [-0.6, -0.8]);
+    }
+
+    #[test]
+    #[should_panic(expected = "GlobalNorm requires a nonnegative limit")]
+    fn global_norm_rejects_nan_limit() {
+        sgd().with_grad_clipping(GradientClipping::GlobalNorm(f32::NAN));
+    }
+
+    #[test]
+    #[should_panic(expected = "Set GlobalNorm on the module optimizer")]
+    fn global_norm_rejects_group_level_clipping() {
+        sgd().with_group(
+            ParamGroup::all(),
+            SgdConfig::new().build(),
+            Some(GradientClipping::GlobalNorm(1.)),
+        );
     }
 
     /// An OptimizerRecord with empty paths map must load cleanly.
